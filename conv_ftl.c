@@ -2,6 +2,7 @@
 
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
+#include <linux/vmalloc.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
