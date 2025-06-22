@@ -4,14 +4,22 @@
 #define _NVMEVIRT_CONV_FTL_H
 
 #include <linux/types.h>
+#include <linux/time.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
 #include "ssd.h"
+
+enum gc_t {
+	Greedy,
+	Random,
+	CostBenefit
+};
 
 struct convparams {
 	uint32_t gc_thres_lines;
 	uint32_t gc_thres_lines_high;
 	bool enable_gc_delay;
+	enum gc_t gc_type;
 
 	double op_area_pcent;
 	int pba_pcent; /* (physical space / logical space) * 100*/
@@ -19,8 +27,10 @@ struct convparams {
 
 struct line {
 	int id; /* line id, the same as corresponding block id */
+	int pqueue_key; /* key of priority queue*/
 	int ipc; /* invalid page count in this line */
 	int vpc; /* valid page count in this line */
+	time64_t mtime; /* latest modified time */
 	struct list_head entry;
 	/* position in the priority queue for victim lines */
 	size_t pos;
@@ -38,6 +48,9 @@ struct write_pointer {
 
 struct line_mgmt {
 	struct line *lines;
+	time64_t time; /* time updated every period */
+	time64_t period; /* priority update period */
+	int shift_cost;
 
 	/* free line list, we only need to maintain a list of blk numbers */
 	struct list_head free_line_list;

@@ -3,6 +3,7 @@
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
 #include <linux/vmalloc.h>
+#include <linux/random.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -72,12 +73,12 @@ static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
 
 static inline pqueue_pri_t victim_line_get_pri(void *a)
 {
-	return ((struct line *)a)->vpc;
+	return ((struct line *)a)->pqueue_key;
 }
 
 static inline void victim_line_set_pri(void *a, pqueue_pri_t pri)
 {
-	((struct line *)a)->vpc = pri;
+	((struct line *)a)->pqueue_key = pri;
 }
 
 static inline size_t victim_line_get_pos(void *a)
@@ -114,6 +115,10 @@ static void init_lines(struct conv_ftl *conv_ftl)
 	struct line *line;
 	int i;
 
+	lm->time = ktime_get_real_seconds();
+	lm->period = 10;
+	lm->shift_cost = 10; // 20
+
 	lm->tt_lines = spp->blks_per_pl;
 	NVMEV_ASSERT(lm->tt_lines == spp->tt_lines);
 	lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
@@ -131,6 +136,8 @@ static void init_lines(struct conv_ftl *conv_ftl)
 			.id = i,
 			.ipc = 0,
 			.vpc = 0,
+			.pqueue_key = 0,
+			.mtime = 0,
 			.pos = 0,
 			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
 		};
@@ -164,6 +171,32 @@ static inline void check_addr(int a, int max)
 {
 	NVMEV_ASSERT(a >= 0 && a < max);
 }
+
+/* update all element of pq : change age with changed lm->time */
+static void update_age(struct conv_ftl *conv_ftl)
+{
+	struct line_mgmt *lm = &conv_ftl->lm;
+	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	pqueue_t *new_pq;
+	struct line *element;
+
+	NVMEV_ASSERT(conv_ftl->cp.gc_type == CostBenefit);
+	// printk(KERN_INFO "GC: update age");
+	
+	lm->time = ktime_get_real_seconds() + lm->period;
+	
+	new_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri, victim_line_get_pri,
+		victim_line_set_pri, victim_line_get_pos,
+		victim_line_set_pos);
+	
+	while ((element = pqueue_pop(lm->victim_line_pq))) {
+		element->pqueue_key = (element->vpc << lm->shift_cost) / (element->ipc * (lm->time - element->mtime));
+		pqueue_insert(new_pq, element);
+	}
+
+	pqueue_free(lm->victim_line_pq);
+	lm->victim_line_pq = new_pq;
+} // change to decrease time to O(n)
 
 static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 {
@@ -215,6 +248,7 @@ static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct convparams *cpp = &conv_ftl->cp;
 	struct line_mgmt *lm = &conv_ftl->lm;
 	struct write_pointer *wpp = __get_wp(conv_ftl, io_type);
 
@@ -258,6 +292,17 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 		NVMEV_ASSERT(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
 		/* there must be some invalid pages in this line */
 		NVMEV_ASSERT(wpp->curline->ipc > 0);
+		if (cpp->gc_type == Greedy) {
+			wpp->curline->pqueue_key = wpp->curline->vpc;
+		} else if (cpp->gc_type == Random) {
+			get_random_bytes(&wpp->curline->pqueue_key, sizeof(wpp->curline->pqueue_key));
+		} else if (cpp->gc_type == CostBenefit) {
+			wpp->curline->mtime = ktime_get_real_seconds();
+			if (ktime_get_real_seconds() >= lm->time) update_age(conv_ftl);
+			wpp->curline->pqueue_key = (wpp->curline->vpc << lm->shift_cost) / (wpp->curline->ipc * (lm->time - wpp->curline->mtime));
+		} else {
+			NVMEV_ASSERT(false);
+		}
 		pqueue_insert(lm->victim_line_pq, wpp->curline);
 		lm->victim_line_cnt++;
 	}
@@ -371,6 +416,7 @@ static void conv_init_params(struct convparams *cpp)
 	cpp->gc_thres_lines_high = 2; /* Need only two lines.(host write, gc)*/
 	cpp->enable_gc_delay = 1;
 	cpp->pba_pcent = (int)((1 + cpp->op_area_pcent) * 100);
+	cpp->gc_type = Greedy;
 }
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,
@@ -488,6 +534,7 @@ static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct convparams *cpp = &conv_ftl->cp;
 	struct line_mgmt *lm = &conv_ftl->lm;
 	struct nand_block *blk = NULL;
 	struct nand_page *pg = NULL;
@@ -515,18 +562,36 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	}
 	line->ipc++;
 	NVMEV_ASSERT(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
+	line->vpc--;
+
 	/* Adjust the position of the victime line in the pq under over-writes */
 	if (line->pos) {
-		/* Note that line->vpc will be updated by this call */
-		pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
-	} else {
-		line->vpc--;
+		if (cpp->gc_type == Greedy) {
+			/* Note that line->pqueue_key will be updated by this call */
+			pqueue_change_priority(lm->victim_line_pq, line->vpc, line);
+		} else if (cpp->gc_type == CostBenefit) {
+			if (ktime_get_real_seconds() >= lm->time) update_age(conv_ftl);
+			line->mtime = ktime_get_real_seconds();
+			pqueue_change_priority(lm->victim_line_pq, (line->vpc << lm->shift_cost) / (line->ipc * (lm->time - line->mtime)), line); // ipc > 0
+		}
 	}
 
 	if (was_full_line) {
 		/* move line: "full" -> "victim" */
 		list_del_init(&line->entry);
 		lm->full_line_cnt--;
+		/* assign proper value to pqueue_key */
+		if (cpp->gc_type == Greedy) {
+			line->pqueue_key = line->vpc;
+		} else if (cpp->gc_type == Random) {
+			get_random_bytes(&line->pqueue_key, sizeof(line->pqueue_key));
+		} else if (cpp->gc_type == CostBenefit) {
+			line->mtime = ktime_get_real_seconds();
+			if (ktime_get_real_seconds() >= lm->time) update_age(conv_ftl);
+			line->pqueue_key = (line->vpc << lm->shift_cost) / (line->ipc * (lm->time - line->mtime));
+		} else {
+			NVMEV_ASSERT(false);
+		}
 		pqueue_insert(lm->victim_line_pq, line);
 		lm->victim_line_cnt++;
 	}
@@ -535,6 +600,8 @@ static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	struct convparams *cpp = &conv_ftl->cp;
+	struct line_mgmt *lm = &conv_ftl->lm;
 	struct nand_block *blk = NULL;
 	struct nand_page *pg = NULL;
 	struct line *line;
@@ -553,6 +620,7 @@ static void mark_page_valid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	line = get_line(conv_ftl, ppa);
 	NVMEV_ASSERT(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
 	line->vpc++;
+	// nothing because 1. the victim block is just for erasing phase 2. when becoming victim block, erase updates mtime later
 }
 
 static void mark_block_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
@@ -756,6 +824,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	int flashpg;
+
+	// printk(KERN_INFO "GC: do_gc");
 
 	victim_line = select_victim_line(conv_ftl, force);
 	if (!victim_line) {
